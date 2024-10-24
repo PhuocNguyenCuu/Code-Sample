@@ -1,0 +1,974 @@
+---
+title: "Fixed to Payment Rate (Main & most updated version)"
+author: "Phuoc Nguyen Cuu"
+date: "2023-11-17"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(reshape2)
+library(stargazer)
+library(rnassqs)
+library(AER)
+library(maps)
+library(tidycensus)
+library(mlogit)
+```
+
+
+# Irrigation data
+
+```{r}
+nassqs_auth(key = "7F010CFE-D538-34D1-B418-9AA994A49E17")
+Sys.getenv("NASSQS_TOKEN")
+
+irrigation_soybeans  <- nassqs(source_desc = "CENSUS", sector_desc = "CROPS", agg_level_desc = "COUNTY", group_desc = "FIELD CROPS", commodity_desc = "SOYBEANS", statisticcat_desc = "AREA HARVESTED", year = c(2012, 2017), short_desc = c("SOYBEANS, IRRIGATED - ACRES HARVESTED", "SOYBEANS - ACRES HARVESTED")) 
+
+irrigation_soybeans <- irrigation_soybeans %>% filter(county_ansi != "") %>% mutate(ST_CTY = paste0(state_fips_code, county_ansi)) %>% select(ST_CTY, short_desc, Value) %>% group_by(ST_CTY, short_desc) %>% mutate(Value = sum(Value)) %>% unique() %>% pivot_wider(names_from = short_desc, values_from = Value) %>% mutate(HIP = `SOYBEANS, IRRIGATED - ACRES HARVESTED`/`SOYBEANS - ACRES HARVESTED`) %>% filter(!is.na(HIP))
+ 
+
+irrigation_corn  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "CORN", statisticcat_desc = "AREA PLANTED",year = 2013:2017, short_desc = c("CORN, IRRIGATED - ACRES PLANTED", "CORN, NON-IRRIGATED - ACRES PLANTED")) 
+
+irrigation_corn <- irrigation_corn %>% filter(county_ansi != "") %>% mutate(ST_CTY = paste0(state_fips_code, county_ansi))  %>% select(ST_CTY, year, prodn_practice_desc, Value) %>% group_by(ST_CTY, prodn_practice_desc) %>% mutate(Value = sum(Value)) %>% select(ST_CTY, prodn_practice_desc, Value) %>% unique() %>% pivot_wider(names_from = prodn_practice_desc, values_from = Value) %>% mutate(HIP = IRRIGATED/(IRRIGATED + `NON-IRRIGATED`)) %>% filter(!is.na(HIP)) 
+
+irrigation_wheat  <- nassqs(source_desc = "CENSUS",  sector_desc = "CROPS", agg_level_desc = "COUNTY", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "AREA HARVESTED",year = c(2012, 2017), short_desc = c("WHEAT, IRRIGATED - ACRES HARVESTED", "WHEAT - ACRES HARVESTED")) 
+
+irrigation_wheat <- irrigation_wheat %>% filter(county_ansi != "") %>% mutate(ST_CTY = paste0(state_fips_code, county_ansi)) %>% select(ST_CTY, year, short_desc, Value) %>% group_by(ST_CTY, short_desc) %>% mutate(Value = sum(Value)) %>% select(ST_CTY, short_desc, Value) %>% unique() %>% pivot_wider(names_from = short_desc, values_from = Value) %>% mutate(HIP = `WHEAT, IRRIGATED - ACRES HARVESTED`/`WHEAT - ACRES HARVESTED`) %>% filter(!is.na(HIP)) 
+
+
+#Write code to deal with ST_CTY = 37167
+```
+
+# Price Projections
+
+```{r}
+#Loading projection file
+#projections <- read_csv("C:/Users/phuoc/Downloads/oce-wasde-report-data-2010-04-to-2015-12.csv")
+
+#Projections directly taken from the publication 
+#   https://www.ers.usda.gov/webdocs/outlooks/95912/oce-2020-1.pdf?v=3228.7
+year_proj <- c("2019", "2020")
+corn_proj <- c(3.80, 3.40)
+wheat_proj <- c(4.70, 4.80)
+soybeans_proj <- c(9.00, 8.85)
+
+corn_ref <- 3.70
+wheat_ref <- 5.50
+soybeans_ref <- 8.40
+```
+# Yield used for PLC calculations by FSA
+```{r}
+decapitalize <- function(input_string) {
+  
+  first_letter <- substr(input_string, 1, 1)
+  rest_of_string <- tolower(substr(input_string, 2, nchar(input_string)))
+  
+  decapitalized_string <- paste(first_letter, rest_of_string, sep = "")
+  
+  return(decapitalized_string)
+}
+
+decapitalize <- Vectorize(decapitalize)
+
+ref_price_assign <- function(x){
+  if(x == "Corn"){
+    return(corn_ref)
+  }
+  if(x == "Wheat"){
+    return(wheat_ref)
+  }
+  if(x == "Soybeans"){
+    return(soybeans_ref)
+  }
+} 
+
+ref_price_assign <- Vectorize(ref_price_assign)
+
+
+
+yield_PLC_2019 <- read_csv(here("data", "2019_PLC_Ylds_Enrolled_BaseCSV.csv")) %>% mutate(ST_CTY = paste0(State, County)) %>% filter(Crop_Name %in% c("WHEAT", "SOYBEANS", "CORN")) %>% select(ST_CTY, Crop_Name, PLC_Yield, State_Name) %>% mutate(Crop_Name = decapitalize(Crop_Name)) %>% rename(Yield_2019 = PLC_Yield)
+
+yield_PLC_2020 <- read_csv(here("data", "2020_PLC_Ylds_Enrolled_BaseCSV.csv")) %>% mutate(ST_CTY = paste0(State, County)) %>% filter(Crop_Name %in% c("WHEAT", "SOYBEANS", "CORN")) %>% select(ST_CTY, Crop_Name, PLC_Yield) %>% mutate(Crop_Name = decapitalize(Crop_Name)) %>% rename(Yield_2020 = PLC_Yield)
+
+yield <- inner_join(yield_PLC_2019, yield_PLC_2020, by = c("ST_CTY", "Crop_Name"))
+
+enrollment_PLC <- read_csv(here("data/2019_enrolled_base_county_crop_program.csv")) %>% filter(Program == "PLC") %>% rename(Crop_Name = 'Crop Name')
+
+expected_payment_data <- inner_join(yield, enrollment_PLC, by = c("ST_CTY", "Crop_Name")) %>% mutate(price_projected_2019 = ifelse(Crop_Name == "Corn", corn_proj[1], NA)) %>% mutate(price_projected_2019 = ifelse(Crop_Name == "Wheat", wheat_proj[1], price_projected_2019)) %>% mutate(price_projected_2019 = ifelse(Crop_Name == "Soybeans", soybeans_proj[1], price_projected_2019))    %>% mutate(price_projected_2020 = ifelse(Crop_Name == "Corn", corn_proj[2], NA)) %>% mutate(price_projected_2020 = ifelse(Crop_Name == "Wheat", wheat_proj[2], price_projected_2020)) %>% mutate(price_projected_2020 = ifelse(Crop_Name == "Soybeans", soybeans_proj[2], price_projected_2020)) 
+
+expected_payment_data <- expected_payment_data %>% mutate(reference_price = ref_price_assign(Crop_Name)) %>% mutate(expected_PLC_payment_2019 = (reference_price - price_projected_2019)*`Enrolled Base`*Yield_2019*0.85) %>% mutate(expected_PLC_payment_2020 = (reference_price - price_projected_2020)*`Enrolled Base`*Yield_2020*0.85)
+
+expected_payment_data <- expected_payment_data %>% mutate(expected_PLC_payment_2019 = ifelse(expected_PLC_payment_2019 > 0, expected_PLC_payment_2019, 0), expected_PLC_payment_2020 = ifelse(expected_PLC_payment_2020 > 0, expected_PLC_payment_2020, 0)) %>% mutate(total_expected_PLC_payment = (expected_PLC_payment_2019 + expected_PLC_payment_2020)/1000)
+```
+
+# Disaster 
+
+```{r}
+DisasterDeclarationsSummaries <- read.csv(here("data","DisasterDeclarationsSummaries.csv"))
+
+
+remove_after_T <- function(date_string) {
+  cleaned_string <- sub("T.*", "", date_string)
+  return(cleaned_string)
+}
+
+remove_after_T <- Vectorize(remove_after_T)
+
+convert_state_code <- function(input_str) {
+  state_fips <- list(
+    AL = "01", AK = "02", AZ = "04", AR = "05", CA = "06", CO = "08", CT = "09", DE = "10",
+    FL = "12", GA = "13", HI = "15", ID = "16", IL = "17", IN = "18", IA = "19", KS = "20",
+    KY = "21", LA = "22", ME = "23", MD = "24", MA = "25", MI = "26", MN = "27", MS = "28",
+    MO = "29", MT = "30", NE = "31", NV = "32", NH = "33", NJ = "34", NM = "35", NY = "36",
+    NC = "37", ND = "38", OH = "39", OK = "40", OR = "41", PA = "42", RI = "44", SC = "45",
+    SD = "46", TN = "47", TX = "48", UT = "49", VT = "50", VA = "51", WA = "53", WV = "54",
+    WI = "55", WY = "56"
+  )
+ return(state_fips[input_str])
+}
+
+convert_state_code <- Vectorize(convert_state_code)
+
+
+#filter by flood and year 2019
+#reformat time variable
+#caculation duration of disaster
+#change the code abbreviation to state code
+#create ST_CTY variable
+disaster <- DisasterDeclarationsSummaries %>% filter(incidentType == "Flood", fyDeclared == 2019) %>% mutate(incidentBeginDate = remove_after_T(incidentBeginDate), incidentEndDate = remove_after_T(incidentEndDate)) %>% mutate(duration = difftime(incidentEndDate, incidentBeginDate, units = "days")) %>% filter(grepl("\\(County\\)", declaredCountyArea))%>% group_by(state, declaredCountyArea, placeCode) %>% summarise(duration = sum(duration)) %>% mutate(state_code = convert_state_code(state)) %>% mutate(placeCode = substr(as.character(placeCode), 3, nchar(placeCode))) %>% mutate(ST_CTY = paste0(state_code, placeCode), duration = as.numeric(duration)) %>% ungroup() %>% select(ST_CTY, duration)
+```
+
+#Distance
+```{r}
+distance <- read_csv(here("data", "sf12010countydistancemiles.csv"))
+
+distance <- distance %>% rename(ST_CTY = county2)
+
+distance <- left_join(distance, disaster, by ="ST_CTY") %>% 
+  filter(!is.na(duration)) %>% 
+  mutate(weighted_duration = duration/mi_to_county) %>%
+  group_by(county1) %>%                
+  arrange(mi_to_county, .by_group = T) %>%    
+  slice_min(order_by = mi_to_county, n = 5) %>% 
+  ungroup()
+
+weighted_surrounding_disaster <- distance %>% 
+  group_by(county1)  %>% 
+  summarize(weighted_duration = sum(weighted_duration)) %>% 
+  rename(ST_CTY = county1)
+```
+
+
+# Wheat
+
+```{r}
+#nassqs_auth(key = "7F010CFE-D538-34D1-B418-9AA994A49E17")
+#Sys.getenv("NASSQS_TOKEN")
+
+#getting yield for wheat
+
+start_year = 1980
+end_year = 2019
+
+for (i in start_year:end_year){
+  if(i == start_year){
+    wheat_winter_yield  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "WHEAT, WINTER - YIELD, MEASURED IN BU / ACRE") 
+  } else{
+  current  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "WHEAT, WINTER - YIELD, MEASURED IN BU / ACRE")
+  wheat_winter_yield <- rbind(wheat_winter_yield, current)}
+}
+wheat_winter_yield <- wheat_winter_yield %>% select(state_fips_code, county_code , year, Value) %>% mutate(ST_CTY = paste0(state_fips_code, county_code)) %>% select(ST_CTY, year, Value) %>% reshape(idvar = "ST_CTY", timevar = "year", direction = "wide") %>% rowwise() %>% mutate(var = var(c_across(2:41), na.rm = T), mean = mean(c_across(2:41), na.rm = T), variability_winter = var/mean) %>% select(ST_CTY, variability_winter) 
+
+
+
+for (i in start_year:end_year){
+  if(i == start_year){
+    wheat_spring_yield  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "WHEAT, SPRING, (EXCL DURUM) - YIELD, MEASURED IN BU / ACRE") 
+  } else{
+  current  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "WHEAT, SPRING, (EXCL DURUM) - YIELD, MEASURED IN BU / ACRE")
+  wheat_spring_yield <- rbind(wheat_spring_yield, current)}
+}
+wheat_spring_yield <- wheat_spring_yield %>% select(state_fips_code, county_code , year, Value) %>% mutate(ST_CTY = paste0(state_fips_code, county_code)) %>% select(ST_CTY, year, Value) %>% reshape(idvar = "ST_CTY", timevar = "year", direction = "wide") %>% rowwise() %>% mutate(var = var(c_across(2:41), na.rm = T), mean = mean(c_across(2:41), na.rm = T), variability_spring = var/mean) %>% select(ST_CTY, variability_spring)
+
+
+
+for (i in start_year:end_year){
+  if(i == start_year){
+    wheat_durum_yield  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "WHEAT, SPRING, DURUM - YIELD, MEASURED IN BU / ACRE") 
+  } else{
+  current  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "WHEAT", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "WHEAT, SPRING, DURUM - YIELD, MEASURED IN BU / ACRE")
+  wheat_durum_yield <- rbind(wheat_durum_yield, current)}
+}
+wheat_durum_yield <- wheat_durum_yield %>% select(state_fips_code, county_code , year, Value) %>% mutate(ST_CTY = paste0(state_fips_code, county_code)) %>% select(ST_CTY, year, Value) %>% reshape(idvar = "ST_CTY", timevar = "year", direction = "wide") %>% rowwise() %>% mutate(var = var(c_across(2:41), na.rm = T), mean = mean(c_across(2:41), na.rm = T), variability_durum = var/mean) %>% select(ST_CTY, variability_durum) 
+```
+
+
+
+
+```{r, eval =F}
+params <- list(
+commodity_desc = "WHEAT",
+year__GE = 2005,
+agg_level_desc = "COUNTY")
+soybean_yield_yield <- nassqs_yields(params)
+
+unique(soybean_yield_yield$short_desc)
+
+#[24] "WHEAT, WINTER - YIELD, MEASURED IN BU / ACRE"      
+#[14] "WHEAT, SPRING, (EXCL DURUM) - YIELD, MEASURED IN BU / ACRE"                                        
+#[19] "WHEAT, SPRING, DURUM - YIELD, MEASURED IN BU / ACRE"                                               
+```
+
+
+```{r}
+#enrollment acres data
+enrollment <- read_csv(here("data/2019_enrolled_base_county_crop_program.csv"))
+
+#calculating enrollment percentage by base acres
+wheat_enrollment <- enrollment %>% filter(`Crop Name` == "Wheat") %>% group_by(ST_CTY) %>% mutate(total_acres = sum(`Enrolled Base`)) %>% mutate(share = `Enrolled Base`/total_acres)
+```
+
+```{r}
+#reshape data from long to wide
+wheat_ARC <- wheat_enrollment %>% select(ST_CTY, Program, share) %>% dcast(ST_CTY ~ Program, value.var = "share", fill = 0) 
+
+#joining all data: enrollment + disaster duration + yield
+full <- full_join(wheat_ARC, disaster, by = "ST_CTY") %>% mutate(duration = if_else(is.na(duration), 0, duration)) %>% full_join(wheat_winter_yield, by= "ST_CTY") %>% full_join(wheat_spring_yield, by= "ST_CTY") %>% full_join(wheat_durum_yield, by= "ST_CTY")
+
+expected_payment_data_wheat <- expected_payment_data %>% filter(Crop_Name == "Wheat") %>% select(ST_CTY, State_Name,  expected_PLC_payment_2019, expected_PLC_payment_2020, total_expected_PLC_payment)
+full <- full_join(full, expected_payment_data_wheat, by = "ST_CTY")
+
+#
+
+data_ARC_Wheat <- read_csv(here("data","2019", "data_ARC_Wheat.csv")) 
+data_ARC_Wheat_irri <- data_ARC_Wheat %>% filter(ARC_CO_Yield_Designation != "All")
+data_ARC_Wheat_irri <- full_join(data_ARC_Wheat_irri, irrigation_wheat %>% select(ST_CTY, HIP), by = "ST_CTY")
+data_ARC_Wheat_irri <- data_ARC_Wheat_irri %>% 
+  mutate(HIP = ifelse(ARC_CO_Yield_Designation == "Irrigated", HIP, 1 - HIP)) %>% 
+  filter(!is.na(HIP)) %>% 
+  mutate(payment_rate = f2019_ARC_CO_Payment_Rate*HIP)
+
+data_ARC_Wheat_irri <- data_ARC_Wheat_irri %>% 
+  group_by(ST_CTY) %>% 
+  mutate(payment_rate = sum(payment_rate)) %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, payment_rate) %>% 
+  unique() %>% mutate(payment = payment_rate)
+
+data_ARC_Wheat <- data_ARC_Wheat %>% 
+  filter(ARC_CO_Yield_Designation == "All") %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, f2019_ARC_CO_Payment_Rate) %>% 
+  rename(payment_rate = f2019_ARC_CO_Payment_Rate) %>% 
+  mutate(payment = payment_rate)
+data_ARC_Wheat_2019 <- rbind(data_ARC_Wheat, data_ARC_Wheat_irri)
+
+
+data_ARC_Wheat <- read_csv(here("data","2020", "data_ARC_Wheat.csv")) 
+data_ARC_Wheat_irri <- data_ARC_Wheat %>% filter(ARC_CO_Yield_Designation != "All")
+data_ARC_Wheat_irri <- full_join(data_ARC_Wheat_irri, irrigation_wheat %>% select(ST_CTY, HIP), by = "ST_CTY")
+data_ARC_Wheat_irri <- data_ARC_Wheat_irri %>% 
+  mutate(HIP = ifelse(ARC_CO_Yield_Designation == "Irrigated", HIP, 1 - HIP)) %>% 
+  filter(!is.na(HIP)) %>% 
+  mutate(payment_rate = f2020_ARC_CO_Payment_Rate*HIP)
+
+data_ARC_Wheat_irri <- data_ARC_Wheat_irri %>% 
+  group_by(ST_CTY) %>% 
+  mutate(payment_rate = sum(payment_rate)) %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, payment_rate) %>% 
+  unique() %>% mutate(payment = payment_rate)
+data_ARC_Wheat <- data_ARC_Wheat %>% 
+  filter(ARC_CO_Yield_Designation == "All") %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, f2020_ARC_CO_Payment_Rate) %>% 
+  rename(payment_rate = f2020_ARC_CO_Payment_Rate) %>% mutate(payment = payment_rate)
+data_ARC_Wheat_2020 <- rbind(data_ARC_Wheat, data_ARC_Wheat_irri)
+
+#
+
+full <- full_join(full, data_ARC_Wheat_2019 %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_ARC_payment_2019 = payment), by ="ST_CTY")
+full <- full_join(full, read_csv(here("data","2019", "data_PLC_Wheat.csv")) %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_PLC_payment_2019 = payment), by ="ST_CTY")
+full <- full_join(full, data_ARC_Wheat_2020 %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_ARC_payment_2020 = payment), by ="ST_CTY")
+
+full <-  full %>% filter(!is.na(ST_CTY) |  !is.na(ARCCO)  | !is.na(PLC) | !is.na(duration) | !is.na(variability_winter)  | !is.na(variability_spring) | !is.na(variability_durum) | !is.na(State_Name) | !is.na(expected_PLC_payment_2019) | !is.na(expected_PLC_payment_2020) | !is.na(total_expected_PLC_payment) | !is.na(actual_ARC_payment_2019) | !is.na(actual_PLC_payment_2019) | !is.na(actual_ARC_payment_2020))
+
+full <- full_join(full, read_csv(here("data","2020", "data_PLC_Wheat.csv")) %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_PLC_payment_2020 = payment), by ="ST_CTY")
+full <- full %>% mutate(actual_ARC_payment_2019 = ifelse(is.na(actual_ARC_payment_2019), 0, actual_ARC_payment_2019),
+                        actual_ARC_payment_2020 = ifelse(is.na(actual_ARC_payment_2020), 0, actual_ARC_payment_2020),
+                        actual_PLC_payment_2019 = ifelse(is.na(actual_PLC_payment_2019), 0, actual_PLC_payment_2019),
+                        actual_PLC_payment_2020 = ifelse(is.na(actual_PLC_payment_2020), 0, actual_PLC_payment_2020))
+full <- full %>% mutate(total_actual_PLC_payment = (actual_PLC_payment_2019 + actual_PLC_payment_2020),
+                        total_actual_ARC_payment = (actual_ARC_payment_2019 + actual_ARC_payment_2020))
+
+#All payments in terms of thousands of dollars
+#At some point think about whether NA + NA should be 0 or not
+```
+
+```{r}
+a <- lm(ARCCO ~ duration + variability_winter + total_expected_PLC_payment, full)
+b <- lm(ARCCO ~ duration + variability_winter  + actual_ARC_payment_2019 + actual_ARC_payment_2020 + actual_PLC_payment_2019 + actual_PLC_payment_2020, full)
+stargazer(a, b, type = "text", title = "Wheat", header = F)
+```
+
+# Testing the Utility composition
+```{r}
+full_test <- full %>% filter(ARCCO != 0 & PLC != 0) %>% mutate(ARCCO_log = log(ARCCO), PLC_log = log(PLC)) %>% mutate(delta = ARCCO_log - PLC_log)
+
+reg_1 <- lm(delta ~ duration, full_test)
+reg_2 <- lm(delta ~ duration + variability_winter, full_test)
+reg_3 <- lm(delta ~ duration + variability_winter + variability_spring, full_test)
+reg_4 <- lm(delta ~ duration + variability_winter + variability_spring + total_expected_PLC_payment, full_test)
+reg_5 <- lm(delta ~ duration + variability_winter + variability_spring + total_actual_ARC_payment, full_test)
+reg_6 <- lm(delta ~ duration + variability_winter + variability_spring + total_actual_ARC_payment + total_actual_PLC_payment, full_test)
+
+stargazer(reg_1, reg_2, reg_3, reg_4, reg_5, reg_6, type = "text")
+```
+
+```{r}
+#No spring variability data
+reg_1 <- lm(delta ~ duration, full_test)
+reg_2 <- lm(delta ~ duration + variability_winter, full_test)
+reg_4 <- lm(delta ~ duration + variability_winter + total_expected_PLC_payment, full_test)
+reg_6 <- lm(delta ~ duration + variability_winter + total_actual_ARC_payment, full_test)
+
+stargazer(reg_1, reg_2, reg_4, reg_6, type = "text", header = F, title = "Results with market share zeroes removed")
+```
+
+
+
+# Soybeans
+
+```{r}
+# #Getting yield data for soybeans
+# soybean_data <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "SOYBEANS", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year__GE = 1995, short_desc = "SOYBEANS - YIELD, MEASURED IN BU / ACRE") 
+# 
+# soybean_yield <- soybean_data %>% select(state_fips_code, county_code , year, Value) %>% mutate(ST_CTY = paste0(state_fips_code, county_code)) %>% select(ST_CTY, year, Value) %>% reshape(idvar = "ST_CTY", timevar = "year", direction = "wide") %>% rowwise() %>% mutate(var = var(c_across(2:19), na.rm = T), mean = mean(c_across(2:19), na.rm = T), variability = var/mean) %>% select(ST_CTY, variability)
+```
+
+```{r}
+start_year = 1980
+end_year = 2019
+
+for (i in start_year:end_year){
+  if(i == 1980){
+    soybean_yield  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "SOYBEANS", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "SOYBEANS - YIELD, MEASURED IN BU / ACRE") 
+  } else{
+  current  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "SOYBEANS", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "SOYBEANS - YIELD, MEASURED IN BU / ACRE")
+  soybean_yield <- rbind(soybean_yield, current)}
+}
+soybean_yield <- soybean_yield %>% select(state_fips_code, county_code , year, Value) %>% mutate(ST_CTY = paste0(state_fips_code, county_code)) %>% select(ST_CTY, year, Value) %>% reshape(idvar = "ST_CTY", timevar = "year", direction = "wide") %>% rowwise() %>% mutate(var = var(c_across(2:41), na.rm = T), mean = mean(c_across(2:41), na.rm = T), variability = var/mean) %>% select(ST_CTY, variability) 
+```
+
+
+```{r, eval =F}
+params <- list(
+commodity_desc = "SOYBEANS",
+year__GE = 2005,
+agg_level_desc = "COUNTY")
+soybean_yield_yield <- nassqs_yields(params)
+
+unique(soybean_yield_yield$short_desc)
+     
+
+# "SOYBEANS - YIELD, MEASURED IN BU / ACRE"                               
+```
+
+
+```{r}
+#getting acre enrollment data
+enrollment <- read_csv(here("data/2019_enrolled_base_county_crop_program.csv"))
+
+Soybeans_enrollment <- enrollment %>% filter(`Crop Name` == "Soybeans") %>% group_by(ST_CTY) %>% mutate(total_acres = sum(`Enrolled Base`)) %>% mutate(share = `Enrolled Base`/total_acres)
+```
+
+```{r}
+Soybeans_ARC <- Soybeans_enrollment %>% select(ST_CTY, Program, share) %>% dcast(ST_CTY ~ Program, value.var = "share", fill = 0) 
+
+full_soybeans <- full_join(Soybeans_ARC, disaster, by = "ST_CTY") %>% mutate(duration = if_else(is.na(duration), 0, duration)) %>% full_join(soybean_yield, by= "ST_CTY")
+
+expected_payment_data_soybeans <- expected_payment_data %>% filter(Crop_Name == "Soybeans") %>% select(ST_CTY, State_Name, expected_PLC_payment_2019, expected_PLC_payment_2020, total_expected_PLC_payment)
+full_soybeans <- full_join(full_soybeans, expected_payment_data_soybeans, by = "ST_CTY")
+
+#
+data_ARC_Soybeans <- read_csv(here("data","2019", "data_ARC_Soybeans.csv")) 
+data_ARC_Soybeans_irri <- data_ARC_Soybeans %>% filter(ARC_CO_Yield_Designation != "All")
+data_ARC_Soybeans_irri <- full_join(data_ARC_Soybeans_irri, irrigation_soybeans %>% select(ST_CTY, HIP), by = "ST_CTY")
+data_ARC_Soybeans_irri <- data_ARC_Soybeans_irri %>% 
+  mutate(HIP = ifelse(ARC_CO_Yield_Designation == "Irrigated", HIP, 1 - HIP)) %>% 
+  filter(!is.na(HIP)) %>% 
+  mutate(payment_rate = f2019_ARC_CO_Payment_Rate*HIP)
+
+data_ARC_Soybeans_irri <- data_ARC_Soybeans_irri %>% 
+  group_by(ST_CTY) %>% 
+  mutate(payment_rate = sum(payment_rate)) %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, payment_rate) %>% 
+  unique() %>% mutate(payment = payment_rate)
+
+data_ARC_Soybeans <- data_ARC_Soybeans %>% 
+  filter(ARC_CO_Yield_Designation == "All") %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, f2019_ARC_CO_Payment_Rate) %>% 
+  rename(payment_rate = f2019_ARC_CO_Payment_Rate) %>% 
+  mutate(payment = payment_rate)
+data_ARC_Soybeans_2019 <- rbind(data_ARC_Soybeans, data_ARC_Soybeans_irri)
+
+
+data_ARC_Soybeans <- read_csv(here("data","2020", "data_ARC_Soybeans.csv")) 
+data_ARC_Soybeans_irri <- data_ARC_Soybeans %>% filter(ARC_CO_Yield_Designation != "All")
+data_ARC_Soybeans_irri <- full_join(data_ARC_Soybeans_irri, irrigation_soybeans %>% select(ST_CTY, HIP), by = "ST_CTY")
+data_ARC_Soybeans_irri <- data_ARC_Soybeans_irri %>% 
+  mutate(HIP = ifelse(ARC_CO_Yield_Designation == "Irrigated", HIP, 1 - HIP)) %>% 
+  filter(!is.na(HIP)) %>% 
+  mutate(payment_rate = f2020_ARC_CO_Payment_Rate*HIP)
+
+data_ARC_Soybeans_irri <- data_ARC_Soybeans_irri %>% 
+  group_by(ST_CTY) %>% 
+  mutate(payment_rate = sum(payment_rate)) %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, payment_rate) %>% 
+  unique() %>% mutate(payment = payment_rate)
+data_ARC_Soybeans <- data_ARC_Soybeans %>% 
+  filter(ARC_CO_Yield_Designation == "All") %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, f2020_ARC_CO_Payment_Rate) %>% 
+  rename(payment_rate = f2020_ARC_CO_Payment_Rate) %>% mutate(payment = payment_rate)
+data_ARC_Soybeans_2020 <- rbind(data_ARC_Soybeans, data_ARC_Soybeans_irri)
+#
+
+full_soybeans <- full_join(full_soybeans, data_ARC_Soybeans_2019 %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_ARC_payment_2019 = payment), by ="ST_CTY")
+full_soybeans <- full_join(full_soybeans, read_csv(here("data","2019", "data_PLC_Soybeans.csv")) %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_PLC_payment_2019 = payment), by ="ST_CTY")
+full_soybeans <- full_join(full_soybeans, data_ARC_Soybeans_2020 %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_ARC_payment_2020 = payment), by ="ST_CTY")
+
+full_soybeans <-  full_soybeans %>% filter(!is.na(ST_CTY) |  !is.na(ARCCO)  | !is.na(PLC) | !is.na(duration) | !is.na(variability) | !is.na(State_Name) | !is.na(expected_PLC_payment_2019) | !is.na(expected_PLC_payment_2020) | !is.na(total_expected_PLC_payment) | !is.na(actual_ARC_payment_2019) | !is.na(actual_PLC_payment_2019) | !is.na(actual_ARC_payment_2020))
+
+full_soybeans <- full_join(full_soybeans, read_csv(here("data","2020", "data_PLC_Soybeans.csv")) %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_PLC_payment_2020 = payment), by ="ST_CTY")
+full_soybeans <- full_soybeans %>% mutate(actual_ARC_payment_2019 = ifelse(is.na(actual_ARC_payment_2019), 0, actual_ARC_payment_2019),
+                        actual_ARC_payment_2020 = ifelse(is.na(actual_ARC_payment_2020), 0, actual_ARC_payment_2020),
+                        actual_PLC_payment_2019 = ifelse(is.na(actual_PLC_payment_2019), 0, actual_PLC_payment_2019),
+                        actual_PLC_payment_2020 = ifelse(is.na(actual_PLC_payment_2020), 0, actual_PLC_payment_2020))
+full_soybeans <- full_soybeans %>% mutate(total_actual_PLC_payment = (actual_PLC_payment_2019 + actual_PLC_payment_2020),
+                        total_actual_ARC_payment = (actual_ARC_payment_2019 + actual_ARC_payment_2020))
+```
+
+```{r}
+a <- lm(ARCCO ~ duration + variability, full_soybeans)
+b <- lm(ARCCO ~ duration + variability + actual_ARC_payment_2019 + actual_ARC_payment_2020 + actual_PLC_payment_2019 + actual_PLC_payment_2020, full_soybeans)
+stargazer(a, b, type = "text", title = "Soybeans", header = F)
+```
+
+```{r}
+full_test_soybeans <- full_soybeans %>% filter(ARCCO != 0 & PLC != 0) %>% mutate(ARCCO_log = log(ARCCO), PLC_log = log(PLC)) %>% mutate(delta = ARCCO_log - PLC_log)
+
+reg_1 <- lm(delta ~ duration, full_test_soybeans)
+reg_2 <- lm(delta ~ duration + variability, full_test_soybeans)
+reg_3 <- lm(delta ~ duration + variability + total_expected_PLC_payment, full_test_soybeans)
+reg_4 <- lm(delta ~ duration + variability + total_actual_ARC_payment, full_test_soybeans)
+
+stargazer(reg_1, reg_2, reg_3, reg_4, type = "text")
+```
+
+# Corn
+
+
+```{r}
+start_year = 1980
+end_year = 2019
+
+for (i in start_year:end_year){
+  if(i == 1980){
+    corn_yield  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "CORN", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "CORN, GRAIN - YIELD, MEASURED IN BU / ACRE")  
+  } else{
+  current  <- nassqs(agg_level_desc = "COUNTY", sector_desc = "CROPS", group_desc = "FIELD CROPS", commodity_desc = "CORN", statisticcat_desc = "YIELD", unit_desc = "BU / ACRE", year = i, short_desc = "CORN, GRAIN - YIELD, MEASURED IN BU / ACRE") 
+  corn_yield <- rbind(corn_yield, current)}
+}
+corn_yield <- corn_yield %>% select(state_fips_code, county_code , year, Value) %>% mutate(ST_CTY = paste0(state_fips_code, county_code)) %>% select(ST_CTY, year, Value) %>% reshape(idvar = "ST_CTY", timevar = "year", direction = "wide") %>% rowwise() %>% mutate(var = var(c_across(2:41), na.rm = T), mean = mean(c_across(2:41), na.rm = T), variability = var/mean) %>% select(ST_CTY, variability) 
+```
+
+
+
+```{r, eval =F}
+params <- list(
+commodity_desc = "CORN",
+year__GE = 2005,
+agg_level_desc = "COUNTY")
+soybean_yield_yield <- nassqs_yields(params)
+
+unique(soybean_yield_yield$short_desc)
+     
+
+# [1] "CORN, GRAIN - YIELD, MEASURED IN BU / ACRE"                  
+```
+
+
+```{r}
+enrollment <- read_csv(here("data/2019_enrolled_base_county_crop_program.csv"))
+
+corn_enrollment <- enrollment %>% filter(`Crop Name` == "Corn") %>% group_by(ST_CTY) %>% mutate(total_acres = sum(`Enrolled Base`)) %>% mutate(share = `Enrolled Base`/total_acres)
+```
+
+```{r}
+corn_ARC <- corn_enrollment %>% select(ST_CTY, Program, share) %>% dcast(ST_CTY ~ Program, value.var = "share", fill = 0) 
+
+full_corn <- full_join(corn_ARC, disaster, by = "ST_CTY") %>% mutate(duration = if_else(is.na(duration), 0, duration)) %>% full_join(corn_yield, by= "ST_CTY")
+
+expected_payment_data_corn <- expected_payment_data %>% filter(Crop_Name == "Corn") %>% select(ST_CTY, State_Name, expected_PLC_payment_2019, expected_PLC_payment_2020, total_expected_PLC_payment)
+full_corn <- full_join(full_corn, expected_payment_data_corn, by = "ST_CTY")
+
+#
+
+data_ARC_Corn <- read_csv(here("data","2019", "data_ARC_Corn.csv")) 
+data_ARC_Corn_irri <- data_ARC_Corn %>% filter(ARC_CO_Yield_Designation != "All")
+data_ARC_Corn_irri <- full_join(data_ARC_Corn_irri, irrigation_corn %>% select(ST_CTY, HIP), by = "ST_CTY")
+data_ARC_Corn_irri <- data_ARC_Corn_irri %>% 
+  mutate(HIP = ifelse(ARC_CO_Yield_Designation == "Irrigated", HIP, 1 - HIP)) %>% 
+  filter(!is.na(HIP)) %>% 
+  mutate(payment_rate = f2019_ARC_CO_Payment_Rate*HIP)
+
+data_ARC_Corn_irri <- data_ARC_Corn_irri %>% 
+  group_by(ST_CTY) %>% 
+  mutate(payment_rate = sum(payment_rate)) %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, payment_rate) %>% 
+  unique() %>% mutate(payment = payment_rate)
+
+data_ARC_Corn <- data_ARC_Corn %>% 
+  filter(ARC_CO_Yield_Designation == "All") %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, f2019_ARC_CO_Payment_Rate) %>% 
+  rename(payment_rate = f2019_ARC_CO_Payment_Rate) %>% 
+  mutate(payment = payment_rate)
+data_ARC_Corn_2019 <- rbind(data_ARC_Corn, data_ARC_Corn_irri)
+
+
+data_ARC_Corn <- read_csv(here("data","2020", "data_ARC_Corn.csv")) 
+data_ARC_Corn_irri <- data_ARC_Corn %>% filter(ARC_CO_Yield_Designation != "All")
+data_ARC_Corn_irri <- full_join(data_ARC_Corn_irri, irrigation_corn %>% select(ST_CTY, HIP), by = "ST_CTY")
+data_ARC_Corn_irri <- data_ARC_Corn_irri %>% 
+  mutate(HIP = ifelse(ARC_CO_Yield_Designation == "Irrigated", HIP, 1 - HIP)) %>% 
+  filter(!is.na(HIP)) %>% 
+  mutate(payment_rate = f2020_ARC_CO_Payment_Rate*HIP)
+
+data_ARC_Corn_irri <- data_ARC_Corn_irri %>% 
+  group_by(ST_CTY) %>% 
+  mutate(payment_rate = sum(payment_rate)) %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, payment_rate) %>% 
+  unique() %>% mutate(payment = payment_rate)
+data_ARC_Corn <- data_ARC_Corn %>% 
+  filter(ARC_CO_Yield_Designation == "All") %>% 
+  select(ST_CTY, Crop_Name, Enrolled_Base, f2020_ARC_CO_Payment_Rate) %>% 
+  rename(payment_rate = f2020_ARC_CO_Payment_Rate) %>% mutate(payment = payment_rate)
+data_ARC_Corn_2020 <- rbind(data_ARC_Corn, data_ARC_Corn_irri)
+
+
+#
+
+
+full_corn <- full_join(full_corn, data_ARC_Corn_2019 %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_ARC_payment_2019 = payment), by ="ST_CTY")
+full_corn <- full_join(full_corn, read_csv(here("data","2019", "data_PLC_Corn.csv")) %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_PLC_payment_2019 = payment), by ="ST_CTY")
+full_corn <- full_join(full_corn, data_ARC_Corn_2020 %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_ARC_payment_2020 = payment), by ="ST_CTY")
+
+full_corn <-  full_corn %>% filter(!is.na(ST_CTY) |  !is.na(ARCCO)  | !is.na(PLC) | !is.na(duration) |  !is.na(variability) | !is.na(State_Name) | !is.na(expected_PLC_payment_2019) | !is.na(expected_PLC_payment_2020) | !is.na(total_expected_PLC_payment) | !is.na(actual_ARC_payment_2019) | !is.na(actual_PLC_payment_2019) | !is.na(actual_ARC_payment_2020))
+
+full_corn <- full_join(full_corn, read_csv(here("data","2020", "data_PLC_Corn.csv")) %>% 
+                         select(ST_CTY, payment) %>% 
+                         rename(actual_PLC_payment_2020 = payment), by ="ST_CTY")
+full_corn <- full_corn %>% mutate(actual_ARC_payment_2019 = ifelse(is.na(actual_ARC_payment_2019), 0, actual_ARC_payment_2019),
+                        actual_ARC_payment_2020 = ifelse(is.na(actual_ARC_payment_2020), 0, actual_ARC_payment_2020),
+                        actual_PLC_payment_2019 = ifelse(is.na(actual_PLC_payment_2019), 0, actual_PLC_payment_2019),
+                        actual_PLC_payment_2020 = ifelse(is.na(actual_PLC_payment_2020), 0, actual_PLC_payment_2020))
+full_corn <- full_corn %>% mutate(total_actual_PLC_payment = (actual_PLC_payment_2019 + actual_PLC_payment_2020),
+                        total_actual_ARC_payment = (actual_ARC_payment_2019 + actual_ARC_payment_2020))
+```
+
+```{r}
+a <- lm(ARCCO ~ duration + variability, full_corn)
+b <- lm(ARCCO ~ duration + variability  + actual_ARC_payment_2019 + actual_ARC_payment_2020 + actual_PLC_payment_2019 + actual_PLC_payment_2020, full_corn)
+stargazer(a, b, type = "text", title = "Corn", header = F)
+```
+```{r}
+full_test_corn <- full_corn %>% filter(ARCCO != 0 & PLC != 0) %>% mutate(ARCCO_log = log(ARCCO), PLC_log = log(PLC)) %>% mutate(delta = ARCCO_log - PLC_log)
+
+reg_1 <- lm(delta ~ duration, full_test_corn)
+reg_2 <- lm(delta ~ duration + variability, full_test_corn)
+reg_3 <- lm(delta ~ duration + variability + total_expected_PLC_payment, full_test_corn)
+reg_4 <- lm(delta ~ duration + variability + total_actual_ARC_payment, full_test_corn)
+
+stargazer(reg_1, reg_2, reg_3, reg_4, type = "text", header = F, title = "Corn - Results with market share zeroes removed")
+```
+
+
+
+
+# Wheat
+
+```{r}
+temp <- full %>% mutate(ARCCO = ifelse(ARCCO == 0, exp(-12), ARCCO))  
+temp <- temp %>% mutate(PLC = ifelse(ARCCO==exp(-12), PLC - exp(-12), PLC))
+temp <- temp %>% mutate(PLC = ifelse(PLC == 0, exp(-12), PLC))
+temp <- temp %>% mutate(ARRCO = ifelse(PLC == exp(-12), ARCCO - exp(-12), ARCCO))
+```
+
+```{r}
+temp_test <- temp %>% mutate(ARCCO_log = log(ARCCO), PLC_log = log(PLC)) %>% mutate(delta = ARCCO_log - PLC_log)
+  
+temp_test <- left_join(temp_test, weighted_surrounding_disaster, by = "ST_CTY")
+
+reg_1 <- lm(delta ~ duration, temp_test)
+reg_2 <- lm(delta ~ duration + variability_winter, temp_test)
+reg_4 <- lm(delta ~ duration + variability_winter + total_expected_PLC_payment, temp_test)
+reg_5 <- lm(delta ~ duration + variability_winter + total_actual_ARC_payment, temp_test)
+reg_6 <- lm(delta ~ duration + variability_winter + total_actual_ARC_payment + total_actual_PLC_payment, temp_test)
+
+stargazer(reg_1, reg_2, reg_4, reg_5, reg_6, type = "text", header = F, title = "Wheat - Results with market share zeroes replaced by exp(-12)")
+```
+
+```{r}
+#No spring variability data
+reg_1 <- lm(delta ~ duration, temp_test)
+reg_2 <- lm(delta ~ duration + variability_winter, temp_test)
+reg_6 <- lm(delta ~ duration + variability_winter + total_actual_ARC_payment, temp_test)
+
+#stargazer(reg_1, reg_2, reg_6, type = "text", header = F, title = "Wheat - Results with market share zeroes replaced by exp(-12)")
+
+#testing IV approach
+iv_6 <- ivreg(delta ~ duration + variability_winter + total_actual_ARC_payment | weighted_duration + variability_winter + total_actual_ARC_payment , data = temp_test)
+
+stargazer(reg_1, reg_2, reg_6, iv_6, type = "text", header = F, title = "Wheat")
+```
+
+# Corn
+```{r}
+temp_corn <- full_corn %>% mutate(ARCCO = ifelse(ARCCO == 0, exp(-12), ARCCO))  
+temp_corn <- temp_corn %>% mutate(PLC = ifelse(ARCCO==exp(-12), PLC - exp(-12), PLC))
+temp_corn <- temp_corn %>% mutate(PLC = ifelse(PLC == 0, exp(-12), PLC))
+temp_corn <- temp_corn %>% mutate(ARRCO = ifelse(PLC == exp(-12), ARCCO - exp(-12), ARCCO))
+```
+
+```{r}
+temp_corn_test <- temp_corn  %>% mutate(ARCCO_log = log(ARCCO), PLC_log = log(PLC)) %>% mutate(delta = ARCCO_log - PLC_log)
+
+temp_corn_test <- left_join(temp_corn_test, weighted_surrounding_disaster, by = "ST_CTY")
+
+
+reg_1 <- lm(delta ~ duration, temp_corn_test)
+reg_2 <- lm(delta ~ duration + variability, temp_corn_test)
+reg_4 <- lm(delta ~ duration + variability + total_actual_ARC_payment, temp_corn_test)
+
+#stargazer(reg_1, reg_2, reg_4, type = "text", header = F, title = "Corn")
+
+#testing IV approach
+iv_4 <- ivreg(delta ~ duration + variability + total_actual_ARC_payment | weighted_duration + variability + total_actual_ARC_payment , data = temp_corn_test)
+
+stargazer(reg_4, iv_4, type = "text", header = F, title = "Corn")
+
+```
+# Soybeans
+```{r}
+temp_soybeans <- full_soybeans %>% mutate(ARCCO = ifelse(ARCCO == 0, exp(-12), ARCCO))  
+temp_soybeans <- temp_soybeans %>% mutate(PLC = ifelse(ARCCO==exp(-12), PLC - exp(-12), PLC))
+temp_soybeans <- temp_soybeans %>% mutate(PLC = ifelse(PLC == 0, exp(-12), PLC))
+temp_soybeans <- temp_soybeans %>% mutate(ARRCO = ifelse(PLC == exp(-12), ARCCO - exp(-12), ARCCO))
+```
+
+```{r}
+temp_soybeans_test <- temp_soybeans %>% mutate(ARCCO_log = log(ARCCO), PLC_log = log(PLC)) %>% mutate(delta = ARCCO_log - PLC_log)
+
+temp_soybeans_test <- left_join(temp_soybeans_test, weighted_surrounding_disaster, by = "ST_CTY")
+
+
+reg_1 <- lm(delta ~ duration, temp_soybeans_test)
+reg_2 <- lm(delta ~ duration + variability, temp_soybeans_test)
+reg_4 <- lm(delta ~ duration + variability + total_actual_ARC_payment, temp_soybeans_test)
+
+#stargazer(reg_1, reg_2, reg_4, type = "text", header = F, title = "Corn - Results with market share zeroes replaced by exp(-12)")
+
+#Testing IV approach
+iv_4 <- ivreg(delta ~ duration + variability + total_actual_ARC_payment | weighted_duration + variability + total_actual_ARC_payment , data = temp_soybeans_test)
+
+stargazer(reg_4, iv_4, type = "text", header = F, title = "Soybeans")
+```
+
+# Map
+```{r}
+county_map <- map_data("county")
+
+data(fips_codes)
+
+remove_county <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bCounty\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_parish <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bParish\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_county <- Vectorize(remove_county)
+
+fips_codes <- fips_codes %>% 
+                  mutate(county = tolower(remove_county(county)), 
+                         state_name = tolower(state_name), 
+                         ST_CTY = paste0(state_code, county_code)) %>%
+                  rename(region = state_name, subregion = county) %>%                   
+                  select(ST_CTY, region, subregion) %>% 
+                  mutate(subregion = ifelse(region == "louisiana", remove_parish(subregion), subregion))
+
+
+county_map <- left_join(county_map, fips_codes, by = c("region", "subregion")) 
+wheat_map <-  temp_test %>% select(ST_CTY, ARCCO) %>% filter(!is.na(ARCCO))
+county_map <- left_join(county_map, wheat_map, by = "ST_CTY")
+
+
+
+missing <- county_map %>% filter(is.na(ST_CTY)) 
+
+
+county_map <- county_map %>% filter(!is.na(ST_CTY))
+
+ggplot() + 
+  geom_polygon( data=county_map, aes(x=long, y=lat, group=ST_CTY, fill= ARCCO),
+                color="black", linewidth = .01 ) +
+  coord_quickmap()  +
+  scale_fill_gradient(low = "white", high = "red", na.value = "white") +
+  theme_void()
+```
+
+
+# Counterfactual for base Scenario
+```{r}
+iv_6 <- ivreg(delta ~ duration + variability_winter + total_actual_ARC_payment | weighted_duration + variability_winter + total_actual_ARC_payment , data = temp_test)
+
+temp_test_counter <- temp_test %>% mutate(duration = duration/1)
+
+temp_test_counter$delta_counter = predict(iv_6, temp_test_counter)
+
+temp_test_counter <- temp_test_counter %>% mutate(ARCCO_counter = exp(delta_counter)/(exp(delta_counter)+1))
+
+
+county_map <- map_data("county")
+
+data(fips_codes)
+
+remove_county <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bCounty\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_parish <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bParish\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_county <- Vectorize(remove_county)
+
+fips_codes <- fips_codes %>% 
+                  mutate(county = tolower(remove_county(county)), 
+                         state_name = tolower(state_name), 
+                         ST_CTY = paste0(state_code, county_code)) %>%
+                  rename(region = state_name, subregion = county) %>%                   
+                  select(ST_CTY, region, subregion) %>% 
+                  mutate(subregion = ifelse(region == "louisiana", remove_parish(subregion), subregion))
+
+
+county_map <- left_join(county_map, fips_codes, by = c("region", "subregion")) 
+wheat_map <-  temp_test_counter %>% select(ST_CTY, ARCCO_counter) %>% filter(!is.na(ARCCO_counter))
+county_map <- left_join(county_map, wheat_map, by = "ST_CTY")
+
+county_map_base <- county_map %>% filter(!is.na(ST_CTY))
+
+ggplot() + 
+  geom_polygon( data=county_map_base, aes(x=long, y=lat, group=ST_CTY, fill= ARCCO_counter),
+                color="black", linewidth = .01 ) +
+  coord_quickmap()  +
+  scale_fill_gradient(low = "white", high = "red", na.value = "white") +
+  theme_void() + 
+  theme(legend.position = "none")
+```
+
+# Counterfactual for Worse scenario
+```{r}
+if(1==1){
+iv_6 <- ivreg(delta ~ duration + variability_winter + total_actual_ARC_payment | weighted_duration + variability_winter + total_actual_ARC_payment , data = temp_test)
+
+temp_test_counter <- temp_test %>% mutate(duration = duration/0.5)
+
+temp_test_counter$delta_counter = predict(iv_6, temp_test_counter)
+
+temp_test_counter <- temp_test_counter %>% mutate(ARCCO_counter = exp(delta_counter)/(exp(delta_counter)+1))
+
+
+county_map <- map_data("county")
+
+data(fips_codes)
+
+remove_county <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bCounty\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_parish <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bParish\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_county <- Vectorize(remove_county)
+
+fips_codes <- fips_codes %>% 
+                  mutate(county = tolower(remove_county(county)), 
+                         state_name = tolower(state_name), 
+                         ST_CTY = paste0(state_code, county_code)) %>%
+                  rename(region = state_name, subregion = county) %>%                   
+                  select(ST_CTY, region, subregion) %>% 
+                  mutate(subregion = ifelse(region == "louisiana", remove_parish(subregion), subregion))
+
+
+county_map <- left_join(county_map, fips_codes, by = c("region", "subregion")) 
+wheat_map <-  temp_test_counter %>% select(ST_CTY, ARCCO_counter) %>% filter(!is.na(ARCCO_counter))
+county_map <- left_join(county_map, wheat_map, by = "ST_CTY")
+
+county_map_bad <- county_map %>% filter(!is.na(ST_CTY))
+
+ggplot() + 
+  geom_polygon( data=county_map_bad, aes(x=long, y=lat, group=ST_CTY, fill= ARCCO_counter),
+                color="black", linewidth = .01 ) +
+  coord_quickmap()  +
+  scale_fill_gradient(low = "white", high = "red", na.value = "white") +
+  theme_void() + 
+  theme(legend.position = "none")
+}
+```
+# Counterfactual for Triple Huge Worse scenario
+```{r}
+if(1==1){
+iv_6 <- ivreg(delta ~ duration + variability_winter + total_actual_ARC_payment | weighted_duration + variability_winter + total_actual_ARC_payment , data = temp_test)
+
+temp_test_counter <- temp_test %>% mutate(duration = duration+100)
+
+temp_test_counter$delta_counter = predict(iv_6, temp_test_counter)
+
+temp_test_counter <- temp_test_counter %>% mutate(ARCCO_counter = exp(delta_counter)/(exp(delta_counter)+1))
+
+
+county_map <- map_data("county")
+
+data(fips_codes)
+
+remove_county <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bCounty\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_parish <- function(place_name) {
+  # Remove the word "County" (case-insensitive) and any trailing/leading whitespace
+  cleaned_name <- gsub("\\bParish\\b", "", place_name, ignore.case = TRUE)
+  # Trim any extra whitespace
+  cleaned_name <- trimws(cleaned_name)
+  return(cleaned_name)
+}
+
+remove_county <- Vectorize(remove_county)
+
+fips_codes <- fips_codes %>% 
+                  mutate(county = tolower(remove_county(county)), 
+                         state_name = tolower(state_name), 
+                         ST_CTY = paste0(state_code, county_code)) %>%
+                  rename(region = state_name, subregion = county) %>%                   
+                  select(ST_CTY, region, subregion) %>% 
+                  mutate(subregion = ifelse(region == "louisiana", remove_parish(subregion), subregion))
+
+
+county_map <- left_join(county_map, fips_codes, by = c("region", "subregion")) 
+wheat_map <-  temp_test_counter %>% select(ST_CTY, ARCCO_counter) %>% filter(!is.na(ARCCO_counter))
+county_map <- left_join(county_map, wheat_map, by = "ST_CTY")
+
+county_map_bad <- county_map %>% filter(!is.na(ST_CTY))
+
+ggplot() + 
+  geom_polygon( data=county_map_bad, aes(x=long, y=lat, group=ST_CTY, fill= ARCCO_counter),
+                color="black", linewidth = .01 ) +
+  coord_quickmap()  +
+  scale_fill_gradient(low = "white", high = "red", na.value = "white") +
+  theme_void() + 
+  theme(legend.position = "none")
+}
+```
+
+# Calculation of difference in base acres between counterfactuals
+```{r}
+wheat_base_acres <- wheat_enrollment %>% distinct(ST_CTY, total_acres, .keep_all = T) %>% select(ST_CTY, total_acres)
+
+county_map_base <- left_join(county_map_base, wheat_base_acres, by = "ST_CTY") %>% distinct(ST_CTY, .keep_all = T)
+county_map_bad <- left_join(county_map_bad, wheat_base_acres, by = "ST_CTY") %>% distinct(ST_CTY, .keep_all = T)
+
+base_scenario <- sum(county_map_bad$ARCCO_counter*county_map_bad$total_acres, na.rm = T)
+
+bad_scenario <- sum(county_map_base$ARCCO_counter*county_map_base$total_acres, na.rm = T) 
+ 
+base_scenario
+bad_scenario
+
+bad_scenario/base_scenario
+```
+
+
+The magnitude of the result is so small.
+
+
+
+
+Billions of dollars are spent annually to support farmers through the Price Loss Coverage and Agricultural Risk Coverage subsidies programs. Of these two, farmers can only choose one every period. Recent models in the literature shows that, given sufficiently low annual yield variability, in the long term farmers and consumers are better off if more farmers elect the Price Loss Coverage program. Groups of farmers recently afflicted by extreme weather events are possibly swayed towards the Agriculture Risk Coverage program due to its yield protection characteristic. This can result in loss of benefits by farmers and consumers in the long term. Using share data on program election, this paper examines whether natural disasters affect the way farmers estimate the benefits of each program. Findings suggests that, controlling for expected payouts, recent experiences with natural disasters do not affect farmers decisions.             
+
+#Notes on research
+Choose not to include ARC-IC due to its relative small share in program election (3.8% in 2019) and it is a necessary simplyfying assumption due to the lack of individual data to calculate for ARC-IC. Maybe can view the markets as county markets for farms that choose not to elect ARC-IC. Source: https://www.fb.org/market-intel/the-results-are-in-plc-is-the-2019-program-of-choice#:~:text=Farmers%20enrolled%20a%20total%20of,4%25%20of%20the%20total%20acres.
+
+Need to gather more data on variability
+
+Try and see if we can calculate expected Payment for ARC-CO
+
+Think about the Utility as the expected payment that every farm/farmer calculates. The factors that goes in includes predictions from forecast and yield risk and price risk. It is possible that the duration of a natural disaster is correlated with factors related to yield risk, hence we need an instrument for duration. Consider factors that affect how fast water retreats after a flood, which affects duration but likely not factors concerning yield and price risk.
+
+Should I observe the market share over time too
+Should I add state-fixed effects?
+Perhaps using payment rate is better than using total payments since total payments is for the entire county but each farmer only considers how much they receive in subsidy per acre of their land. 
+Large endogeneity between Payment rate and Yield variability.
+
+Prices used in the calculation of expected payments are the long-term price projections taken from the USDA Agricultural Projections to 2029 report prepared by the World Agricultural Outlook Board. These projections were released in February 2020 and represent the information on future prices that farmers could have used to calculate expected payments before they had to make program elections before March 16, 2020.
+
